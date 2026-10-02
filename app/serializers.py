@@ -3,6 +3,7 @@ from .planning import (
     Node,
     Pipe,
     PlanResult,
+    FlowCheckResult,
     RecommendResult,
     RestoreResult,
     SourceSwitchResult,
@@ -104,6 +105,20 @@ def serialize_source_switch_preview(
         "restored_sink_ids": list(result.restored_sink_ids),
         "block_reasons": [b.as_dict() for b in result.blocks],
         "issues": [i.as_dict() for i in result.issues],
+    }
+
+
+def serialize_flow_check(
+    version: int,
+    expected_version: int,
+    result: FlowCheckResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "demand_total": result.demand_total,
+        "max_deliverable": result.max_deliverable,
+        "feasible": result.feasible,
     }
 
 

@@ -13,8 +13,12 @@
 不可复用编号的**操作后状态快照**，供调度员按操作顺序回看当时的节点、水源运行状态、
 管段阀位、待修复故障与由运行水源可达的用水点，并支持相邻快照六类净变化对照。
 
-> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演）
-> 只以**运行中**的水源为供水起点；停运水源不再供水。
+调度员可携带**已读版本**与**全覆盖的水源供水上限、管段双向共用输水上限、非空用水点
+最低需求**（均为非负整数升/小时），在**当前阀位与故障状态**下只读核算一组用水点的
+最低流量能否全部满足，返回需求总量与最大可交付总量。
+
+> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
+> 最低流量核算）只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
 
@@ -171,6 +175,26 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   显式 `base_id` 必须与目标快照**相邻**，否则 `422 SNAPSHOT_NOT_ADJACENT`；
   未知快照编号统一 `404 SNAPSHOT_NOT_FOUND`，绝不静默返回当前状态。
 
+**最低流量核算**（`POST /api/dispatch/flow-check`，**只读**，不改阀位/事件/版本/快照）：
+
+- 入参为已读 `version`、每个水源的供水上限 `sources`、每条管段的双向共用输水上限
+  `pipes` 与非空用水点需求 `demands`；所有流量均为**非负整数**升/小时；
+- **全覆盖且同类不重复**：水源、管段编号必须与当前管网逐一对应
+  （不能缺、不能多、不能重复）；用水点编号必须存在且确为 `sink`，同批不得重复；
+  编号存在但类型不符（非水源/非用水点）同样拒绝。任一结构问题**整体拒绝**
+  （`422 FLOW_CHECK_INVALID`，返回全部问题明细），不进行流量核算；
+- 负容量/小数/字符串/空编号、空需求列表、请求体内未知字段由请求模型直接 `422` 拒绝；
+- 停运水源不供水（供水弧容量按 0 计）；**已关闭阀门与待修复故障管段不进入流网**
+  （与既有可达性口径完全一致）；未列需求的用水点不接超级汇、**不消耗流量**；
+- **一条管段两方向合计不得超过其输水上限**：流网中按正反两方向各建一条容量为该上限
+  的弧（双向同时为正的对输总可消去，最大流值与“双向共用上限”的无向约束等价）；
+- 以整数**最大流**（超级源→各水源；需求用水点→超级汇）求这些用水点合计的
+  **最大可交付总量** `max_deliverable`；返回当前版本 `version`、`version_match`、
+  需求总量 `demand_total`、`max_deliverable` 与 `feasible`
+  （`max_deliverable >= demand_total` 即 `true`）；
+- **过期版本仍按当前状态核算**：不返回 409，只把 `version_match` 置为 `false`
+  （与各预演接口一致）；空网（无水源/管段）下全覆盖请求必然为空，按非法请求拒绝。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -186,6 +210,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/isolation/events/{event_id}/restore` | 复供确认（单事务复核 + 重开阀门） |
 | POST | `/api/sources/switch/preview` | 水源停运/恢复预演（只读：失供/恢复用水点、待修复故障重新进水风险） |
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
+| POST | `/api/dispatch/flow-check` | 最低流量核算（只读：需求总量、最大可交付总量、能否全部满足） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
@@ -712,6 +737,94 @@ python3 examples/snapshot_demo.py http://localhost:8000
 相邻对照六类净变化 → 版本冲突、不可隔离、水源空切换均不留快照 →
 整网重导版本重置但旧快照不覆盖、编号不复用 → 未知编号与非相邻对照报错。
 
+### 11. 最低流量核算（调度员只读核算）
+
+流量核算演示使用双水源联网管网 `examples/flow_network.json`：
+
+```
+S1 --R1[阀]-- C --R3[阀]-- U1
+S2 --R2[阀]-/ | \--R4[阀]-- U2
+              R5[阀]
+                |
+                D --R6(无阀)-- U3
+```
+
+导入后携带**已读版本**、每个水源的供水上限、每条管段的双向共用输水上限与非空
+用水点需求发起核算（所有流量均为非负整数升/小时）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/dispatch/flow-check \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "sources": [
+      {"source_id": "S1", "supply_capacity": 500},
+      {"source_id": "S2", "supply_capacity": 500}
+    ],
+    "pipes": [
+      {"pipe_id": "R1", "capacity": 500},
+      {"pipe_id": "R2", "capacity": 500},
+      {"pipe_id": "R3", "capacity": 300},
+      {"pipe_id": "R4", "capacity": 300},
+      {"pipe_id": "R5", "capacity": 300},
+      {"pipe_id": "R6", "capacity": 300}
+    ],
+    "demands": [
+      {"sink_id": "U1", "demand": 200},
+      {"sink_id": "U2", "demand": 200},
+      {"sink_id": "U3", "demand": 200}
+    ]
+  }'
+```
+
+两源共 1000、各管段充裕，三点共需 600 可全部满足：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "demand_total": 600,
+  "max_deliverable": 600,
+  "feasible": true
+}
+```
+
+收紧两座水厂出厂干管（`R1=200`、`R2=200`）后，最多只能把 400 升/小时送入联络点 C：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "demand_total": 600,
+  "max_deliverable": 400,
+  "feasible": false
+}
+```
+
+口径与拒绝约定：
+
+- 停运水源不供水；已关闭阀门与待修复故障管段不可通行（与隔离/复供/水源切换的
+  通水口径一致）；未列需求的用水点不消耗流量；
+- 一条管段**两方向合计**不得超过其 `capacity`；
+- 用过期版本核算（如 `"version": 99`）不报错、不冲突，仍按当前状态计算，
+  只返回 `"version_match": false`；
+- 水源/管段编号未全覆盖（缺、多）、同类重复、编号不存在或节点类型不符、
+  需求列表为空 → `422 FLOW_CHECK_INVALID`，`issues` 给出全部明细；
+- 负容量、小数值、字符串值、空编号、未知请求字段 → 请求模型直接 `422`；
+- 接口为纯只读：阀位、隔离事件、版本与状态快照均不发生任何变化。
+
+最低流量核算全流程演示脚本（标准库实现）：
+
+```bash
+python3 examples/flow_check_demo.py
+# 或指定地址：
+python3 examples/flow_check_demo.py http://localhost:8000
+```
+
+脚本依次演示：导入 → 全覆盖核算满足 → 出厂干管受限不可全部满足 → 过期版本仍按
+当前状态核算 → 停运水源后顶供不足 → 关阀隔离故障后片区不可交付 → 仅核算未被隔离
+用水点 → 结构非法整体拒绝 → 类型/数值错误拒绝 → 确认核算全程只读。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -740,13 +853,13 @@ python3 examples/source_switch_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，48 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，59 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，55 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，63 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、最低流量核算、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -759,7 +872,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、最低流量核算(Dinic 整数最大流)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -767,10 +880,12 @@ examples/
   sample_network.json     # 隔离演示管网
   restore_network.json    # 复供演示管网（叠加故障）
   sources_network.json    # 水源调度演示管网（双水源联网）
+  flow_network.json       # 最低流量核算演示管网（双水源联网 + 独立片区）
   demo.py                 # 隔离全流程示例
   restore_demo.py         # 复供全流程示例
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
+  flow_check_demo.py      # 最低流量核算全流程示例（满足/受限/停运/故障阻断/非法拒绝/只读）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py

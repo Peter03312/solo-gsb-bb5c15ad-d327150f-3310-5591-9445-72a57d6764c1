@@ -1538,6 +1538,201 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
 
+    # ---------------------------------------------------------- 最低流量核算
+
+    def _flow_payload(self, version=1, *, source_cap=1000, pipe_cap=1000,
+                      demands=None):
+        return {
+            "version": version,
+            "sources": [{"source_id": "S", "supply_capacity": source_cap}],
+            "pipes": [
+                {"pipe_id": pid, "capacity": pipe_cap}
+                for pid in ("P1", "P2", "P3", "P4", "P5", "P6")
+            ],
+            "demands": demands
+            if demands is not None
+            else [
+                {"sink_id": "U1", "demand": 100},
+                {"sink_id": "U2", "demand": 100},
+                {"sink_id": "U3", "demand": 100},
+            ],
+        }
+
+    def test_flow_check_feasible(self):
+        self._import()
+        r = self.client.post("/api/dispatch/flow-check", json=self._flow_payload())
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertEqual(body["demand_total"], 300)
+        self.assertEqual(body["max_deliverable"], 300)
+        self.assertTrue(body["feasible"])
+        # 只读：版本/阀位/事件/快照均无变化
+        self.assertEqual(STORE.version, 1)
+        self.assertEqual(STORE.events, [])
+        self.assertEqual(len(STORE.snapshots), 1)
+
+    def test_flow_check_bottleneck_and_stale_version(self):
+        self._import()
+        # 干管 P1 上限 150：三点共需 300 无法全部满足；过期版本仍按当前状态核算
+        payload = self._flow_payload(version=99, pipe_cap=1000)
+        payload["pipes"][0]["capacity"] = 150  # P1 = S-A
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["version_match"])
+        self.assertEqual(body["version"], 1)
+        self.assertEqual(body["demand_total"], 300)
+        self.assertEqual(body["max_deliverable"], 150)
+        self.assertFalse(body["feasible"])
+
+    def test_flow_check_respects_closed_valve_and_pending_fault(self):
+        self._import()
+        # 提交隔离 P6 关 P4：U3 失供（版本 2，P4 关、P6 待修复均不可通行）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        r = self.client.post(
+            "/api/dispatch/flow-check", json=self._flow_payload(version=2)
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["max_deliverable"], 200)
+        self.assertFalse(body["feasible"])
+        # 只核算 U1/U2 时可全部满足
+        payload = self._flow_payload(
+            version=2, demands=[
+                {"sink_id": "U1", "demand": 100},
+                {"sink_id": "U2", "demand": 100},
+            ]
+        )
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        body = r.json()
+        self.assertEqual(body["demand_total"], 200)
+        self.assertEqual(body["max_deliverable"], 200)
+        self.assertTrue(body["feasible"])
+
+    def test_flow_check_stopped_source_supplies_nothing(self):
+        self._import()
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.post(
+            "/api/dispatch/flow-check", json=self._flow_payload(version=2)
+        )
+        body = r.json()
+        self.assertEqual(body["max_deliverable"], 0)
+        self.assertFalse(body["feasible"])
+
+    def test_flow_check_two_source_network(self):
+        r = self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        self.assertEqual(r.status_code, 200)
+        payload = {
+            "version": 1,
+            "sources": [
+                {"source_id": "S1", "supply_capacity": 30},
+                {"source_id": "S2", "supply_capacity": 30},
+            ],
+            "pipes": [
+                {"pipe_id": "Q1", "capacity": 30},
+                {"pipe_id": "Q3", "capacity": 30},
+                {"pipe_id": "Q2", "capacity": 60},
+                {"pipe_id": "Q4", "capacity": 60},
+            ],
+            "demands": [
+                {"sink_id": "U1", "demand": 50},
+                {"sink_id": "U2", "demand": 50},
+            ],
+        }
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        # 两源合计 60，需求 100 -> 不可全部满足
+        self.assertEqual(body["max_deliverable"], 60)
+        self.assertFalse(body["feasible"])
+
+    def test_flow_check_rejects_missing_coverage_and_duplicates(self):
+        self._import()
+        # 缺少水源 S、缺少管段 P5/P6
+        payload = {
+            "version": 1,
+            "sources": [],
+            "pipes": [
+                {"pipe_id": pid, "capacity": 10}
+                for pid in ("P1", "P2", "P3", "P4")
+            ],
+            "demands": [{"sink_id": "U1", "demand": 1}],
+        }
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "FLOW_CHECK_INVALID")
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("FLOW_SOURCE_MISSING", codes)
+        self.assertIn("FLOW_PIPE_MISSING", codes)
+        self.assertEqual(STORE.version, 1)
+
+        # 编号不存在 / 非水源 / 同类重复 / 用水点类型错误
+        payload = self._flow_payload()
+        payload["sources"] = [
+            {"source_id": "S", "supply_capacity": 10},
+            {"source_id": "S", "supply_capacity": 20},
+            {"source_id": "U1", "supply_capacity": 5},
+        ]
+        payload["pipes"][1] = {"pipe_id": "P2", "capacity": 1}
+        payload["pipes"].append({"pipe_id": "PX", "capacity": 1})
+        payload["demands"] = [
+            {"sink_id": "U1", "demand": 1},
+            {"sink_id": "U1", "demand": 2},
+            {"sink_id": "A", "demand": 3},
+        ]
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        self.assertEqual(r.status_code, 422)
+        codes = {i["code"] for i in r.json()["error"]["issues"]}
+        self.assertIn("FLOW_SOURCE_DUPLICATE", codes)
+        self.assertIn("FLOW_SOURCE_NOT_SOURCE", codes)
+        self.assertIn("FLOW_PIPE_DUPLICATE", codes)
+        self.assertIn("FLOW_PIPE_NOT_FOUND", codes)
+        self.assertIn("FLOW_SINK_DUPLICATE", codes)
+        self.assertIn("FLOW_SINK_NOT_SINK", codes)
+
+    def test_flow_check_rejects_bad_types_and_values(self):
+        self._import()
+        # 负容量、小数、字符串、空编号、未知字段、空需求列表
+        bad_bodies = [
+            {**self._flow_payload(), "sources": [{"source_id": "S", "supply_capacity": -1}]},
+            {**self._flow_payload(), "pipes": [
+                {"pipe_id": pid, "capacity": 1.5}
+                for pid in ("P1", "P2", "P3", "P4", "P5", "P6")
+            ]},
+            {**self._flow_payload(), "demands": [{"sink_id": "U1", "demand": "10"}]},
+            {**self._flow_payload(), "version": -1},
+            {**self._flow_payload(), "unknown_field": 1},
+            {**self._flow_payload(), "demands": []},
+        ]
+        for body in bad_bodies:
+            r = self.client.post("/api/dispatch/flow-check", json=body)
+            self.assertEqual(r.status_code, 422, body)
+
+    def test_flow_check_on_empty_network_rejected(self):
+        # 空网（版本 0）：全覆盖约束下 sources/pipes/demands 均为空 ->
+        # 请求模型直接 422（min_length），不会进入业务核算
+        payload = {
+            "version": 0,
+            "sources": [],
+            "pipes": [],
+            "demands": [],
+        }
+        r = self.client.post("/api/dispatch/flow-check", json=payload)
+        self.assertEqual(r.status_code, 422)
+        # 核算只读：空网版本仍为 0，无快照
+        self.assertEqual(STORE.version, 0)
+        self.assertEqual(STORE.snapshots, [])
+
 
 if __name__ == "__main__":
     unittest.main()

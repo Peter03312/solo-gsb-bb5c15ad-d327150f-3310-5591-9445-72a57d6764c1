@@ -12,6 +12,7 @@
 - POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
+- POST /api/dispatch/flow-check                        最低流量核算（只读：需求总量/最大可交付总量/能否满足）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -29,6 +30,7 @@ from .planning import (
     Node,
     Pipe,
     diff_states,
+    evaluate_flow_check,
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
@@ -42,6 +44,7 @@ from .schemas import (
     RecommendIn,
     RestoreIn,
     SourceSwitchIn,
+    FlowCheckIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -51,6 +54,7 @@ from .schemas import (
     RestoreOut,
     SourceSwitchPreviewOut,
     SourceSwitchOut,
+    FlowCheckOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -61,6 +65,7 @@ from .serializers import (
     serialize_recommend,
     serialize_restore_preview,
     serialize_source_switch_preview,
+    serialize_flow_check,
     serialize_snapshot,
     serialize_snapshot_row,
     serialize_snapshot_diff,
@@ -474,6 +479,48 @@ def source_switch_confirm(payload: SourceSwitchIn):
     return _switch_response_body(
         outcome["version"], targets, result, outcome["snapshot_id"]
     )
+
+
+# ---------------------------------------------------------------- 最低流量核算
+
+
+@app.post(
+    "/api/dispatch/flow-check",
+    response_model=FlowCheckOut,
+    tags=["调度核算"],
+    summary="最低流量核算：当前阀位与故障下用水点最低需求能否全部满足（只读）",
+)
+def dispatch_flow_check(payload: FlowCheckIn):
+    with db.get_conn() as conn:
+        # 只读：普通读取即可，不锁版本行；过期版本仍按当前状态核算
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    # 与既有通水口径一致：已关闭阀门与待修复故障管段不可通行
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = evaluate_flow_check(
+        nodes,
+        pipes,
+        source_caps=[(s.source_id, s.supply_capacity) for s in payload.sources],
+        pipe_caps=[(p.pipe_id, p.capacity) for p in payload.pipes],
+        demands=[(d.sink_id, d.demand) for d in payload.demands],
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    if result.issues:
+        raise ApiError(
+            422,
+            "FLOW_CHECK_INVALID",
+            "流量核算请求非法：水源/管段编号未覆盖当前管网或重复，"
+            "用水点编号不存在或类型不符，或需求列表为空",
+            issues=result.issues,
+        )
+
+    return serialize_flow_check(version, payload.version, result)
 
 
 # ---------------------------------------------------------------- 状态快照回看

@@ -29,12 +29,25 @@
   用水点，以及每条待修复故障管段的重新进水风险；仅水源节点可切换，同批编号
   不得重复；全部目标状态已满足（无实际变化）时不推进版本；停运可导致全网无
   运行水源（此时所有用水点失供，不额外报错）。
+
+最低流量核算（flow check）规则：
+- 只读：在当前阀位与待修复故障下，核算一组用水点的最低需求能否被满足，
+  不改阀位/事件/版本/快照。
+- 请求必须携带每个水源的供水上限、每条管段的“双向共用”输水上限及非空的
+  用水点需求（均为非负整数升/小时）；水源/管段编号必须与当前管网逐一对应
+  （全覆盖、不多不少、同类不重复），用水点编号必须存在且确为 sink。
+- 停运水源供水弧容量为 0；已关闭阀门与待修复故障管段不加入流网；
+  一条管段正反两方向合计不得超过其输水上限（建模为两个方向各一条容量弧，
+  双向对输可消去，最大流值与无向共用容量约束等价）。
+- 以整数最大流求这些用水点合计的最大可交付总量 max_deliverable；
+  达到需求总量即 feasible=true。未列需求的用水点不接超级汇、不消耗流量。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import deque
 from itertools import combinations
+import sys
 
 # 问题代码 ---------------------------------------------------------------
 
@@ -59,6 +72,19 @@ NON_VALVE_PIPE_CLOSED = "NON_VALVE_PIPE_CLOSED"
 SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"          # 编号不存在
 SOURCE_NOT_SWITCHABLE = "SOURCE_NOT_SWITCHABLE"  # 节点存在但不是水源，不可切换
 SOURCE_TARGET_DUPLICATE = "SOURCE_TARGET_DUPLICATE"  # 同批水源编号重复
+
+# 流量核算问题
+FLOW_SOURCE_NOT_FOUND = "FLOW_SOURCE_NOT_FOUND"  # 水源编号不存在
+FLOW_SOURCE_NOT_SOURCE = "FLOW_SOURCE_NOT_SOURCE"  # 节点存在但不是水源
+FLOW_SOURCE_DUPLICATE = "FLOW_SOURCE_DUPLICATE"  # 同批水源编号重复
+FLOW_SOURCE_MISSING = "FLOW_SOURCE_MISSING"  # 当前管网有水源未在请求中给出上限
+FLOW_PIPE_NOT_FOUND = "FLOW_PIPE_NOT_FOUND"  # 管段编号不存在
+FLOW_PIPE_DUPLICATE = "FLOW_PIPE_DUPLICATE"  # 同批管段编号重复
+FLOW_PIPE_MISSING = "FLOW_PIPE_MISSING"  # 当前管网有管段未在请求中给出输水上限
+FLOW_SINK_NOT_FOUND = "FLOW_SINK_NOT_FOUND"  # 用水点编号不存在
+FLOW_SINK_NOT_SINK = "FLOW_SINK_NOT_SINK"  # 节点存在但不是用水点
+FLOW_SINK_DUPLICATE = "FLOW_SINK_DUPLICATE"  # 同批用水点需求重复
+FLOW_NO_DEMAND = "FLOW_NO_DEMAND"  # 请求未给出任何非空用水点需求
 
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
@@ -208,6 +234,24 @@ class RecommendResult:
     recommended_close_pipe_ids: list[str]
     affected_sink_ids: list[str]
     reason: Issue | None = None
+
+
+@dataclass
+class FlowCheckResult:
+    """用水点最低流量核算结果（只读计算，不改任何状态）。
+
+    - demand_total：请求中各用水点最低需求量之和；
+    - max_deliverable：在当前阀位/故障与各上限约束下，这些用水点合计可交付的
+      最大流量（升/小时）；
+    - feasible：max_deliverable >= demand_total，即能否全部满足。
+    请求结构非法（编号不覆盖、不存在、类型不符、同类重复）时 issues 非空，
+    不进行流量核算，max_deliverable 为 0。
+    """
+
+    demand_total: int = 0
+    max_deliverable: int = 0
+    feasible: bool = False
+    issues: list[Issue] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------- 导入校验
@@ -887,3 +931,268 @@ def diff_states(base: dict | None, target: dict) -> dict:
         "open_faults": {"added": fault_added, "removed": fault_removed},
         "supplied_sinks": {"added": sink_added, "removed": sink_removed},
     }
+
+
+# ---------------------------------------------------------------- 最低流量核算
+
+
+def validate_flow_request(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int]],
+) -> list[Issue]:
+    """校验最低流量核算请求（流量字段由请求模型保证为非负整数）。
+
+    - 水源/管段编号必须**覆盖当前管网**（既不能多也不能少）且同类不得重复；
+    - 编号存在但节点类型不符（非水源 / 非用水点）同样拒绝；
+    - 用水点编号必须存在、必须是 sink，且至少给出一条需求。
+    任一不满足都整体拒绝，返回全部问题明细。
+    """
+    issues: list[Issue] = []
+
+    # ---- 水源上限 ----
+    expected_sources = {nid for nid, n in nodes.items() if n.type == "source"}
+    seen_sources: set[str] = set()
+    for source_id, _cap in source_caps:
+        if source_id in seen_sources:
+            issues.append(
+                Issue(
+                    FLOW_SOURCE_DUPLICATE,
+                    f"水源编号重复：{source_id}",
+                    source_id,
+                )
+            )
+            continue
+        seen_sources.add(source_id)
+        node = nodes.get(source_id)
+        if node is None:
+            issues.append(
+                Issue(FLOW_SOURCE_NOT_FOUND, f"水源节点不存在：{source_id}", source_id)
+            )
+        elif node.type != "source":
+            issues.append(
+                Issue(
+                    FLOW_SOURCE_NOT_SOURCE,
+                    f"节点 {source_id} 不是水源，不能给出供水上限",
+                    source_id,
+                )
+            )
+    for missing in sorted(expected_sources - seen_sources):
+        issues.append(
+            Issue(
+                FLOW_SOURCE_MISSING,
+                f"缺少当前管网水源的供水上限：{missing}",
+                missing,
+            )
+        )
+
+    # ---- 管段双向共用输水上限 ----
+    seen_pipes: set[str] = set()
+    for pipe_id, _cap in pipe_caps:
+        if pipe_id in seen_pipes:
+            issues.append(
+                Issue(
+                    FLOW_PIPE_DUPLICATE,
+                    f"管段编号重复：{pipe_id}",
+                    pipe_id,
+                )
+            )
+            continue
+        seen_pipes.add(pipe_id)
+        if pipe_id not in pipes:
+            issues.append(
+                Issue(FLOW_PIPE_NOT_FOUND, f"管段不存在：{pipe_id}", pipe_id)
+            )
+    for missing in sorted(set(pipes) - seen_pipes):
+        issues.append(
+            Issue(
+                FLOW_PIPE_MISSING,
+                f"缺少当前管网管段的双向共用输水上限：{missing}",
+                missing,
+            )
+        )
+
+    # ---- 用水点需求（非空） ----
+    if not demands:
+        issues.append(
+            Issue(FLOW_NO_DEMAND, "用水点需求列表不能为空：至少给出一条非负需求")
+        )
+    seen_sinks: set[str] = set()
+    for sink_id, _demand in demands:
+        if sink_id in seen_sinks:
+            issues.append(
+                Issue(
+                    FLOW_SINK_DUPLICATE,
+                    f"用水点需求重复：{sink_id}",
+                    sink_id,
+                )
+            )
+            continue
+        seen_sinks.add(sink_id)
+        node = nodes.get(sink_id)
+        if node is None:
+            issues.append(
+                Issue(FLOW_SINK_NOT_FOUND, f"用水点节点不存在：{sink_id}", sink_id)
+            )
+        elif node.type != "sink":
+            issues.append(
+                Issue(
+                    FLOW_SINK_NOT_SINK,
+                    f"节点 {sink_id} 不是用水点，不能给出用水需求",
+                    sink_id,
+                )
+            )
+    return issues
+
+
+def evaluate_flow_check(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> FlowCheckResult:
+    """核算当前阀位与故障状态下能否满足一组用水点最低流量（只读）。
+
+    source_caps：(水源编号, 供水上限) 列表，必须覆盖当前全部水源；
+    pipe_caps：(管段编号, 双向共用输水上限) 列表，必须覆盖当前全部管段；
+    demands：(用水点编号, 最低需求) 列表，非空；
+    blocked_pipe_ids：不可通行管段（已关闭阀门 ∪ 待修复故障管段），
+    与既有可达性口径完全一致；停运水源(running=False)供水弧容量按 0 处理。
+
+    建模为整数最大流：超级源 → 各水源（容量=供水上限，停运源为 0）；
+    每条可通行管段按正反两方向各加一条容量=输水上限的弧（见下）；
+    各需求用水点 → 超级汇（容量=最低需求）。最大流即这些用水点合计
+    可交付的最大流量 max_deliverable；max_deliverable 达到需求总量即满足。
+
+    双向共用上限：任一管段在同一时刻不会出现“两方向流量同时为正”的最优解
+    （若 x>0 沿 u→v 且 y>0 沿 v→u，消去 min(x,y) 后两方向都减少，
+    合计由 x+y 变为 |x-y|，各节点守恒与源/汇流量均不变），故两个方向各给
+    容量 c 的弧，其最大流值与“两方向合计 ≤ c”的无向容量约束完全等价。
+    """
+    issues = validate_flow_request(nodes, pipes, source_caps, pipe_caps, demands)
+    demand_total = sum(demand for _sid, demand in demands)
+    if issues:
+        return FlowCheckResult(
+            demand_total=demand_total,
+            max_deliverable=0,
+            feasible=False,
+            issues=issues,
+        )
+
+    source_cap_map = dict(source_caps)
+    pipe_cap_map = dict(pipe_caps)
+    demand_map = dict(demands)
+
+    super_source, super_sink = "__flow_source__", "__flow_sink__"
+    edges: list[tuple[str, str, int]] = []
+
+    # 超级源 → 水源：运行中水源容量为其供水上限；停运水源不供水（容量 0）
+    for nid, node in nodes.items():
+        if node.type == "source":
+            cap = source_cap_map[nid] if node.running else 0
+            if cap > 0:
+                edges.append((super_source, nid, cap))
+
+    # 可通行管段：正反两方向各一条容量弧；已关阀门与待修复故障管段不可通行
+    for pid, pipe in pipes.items():
+        if pid in blocked_pipe_ids:
+            continue
+        cap = pipe_cap_map[pid]
+        if cap > 0:
+            edges.append((pipe.from_node, pipe.to_node, cap))
+            edges.append((pipe.to_node, pipe.from_node, cap))
+
+    # 用水点 → 超级汇：仅列入请求的用水点消耗流量，其余用水点不消耗
+    for sink_id, demand in demands:
+        if demand > 0:
+            edges.append((sink_id, super_sink, demand))
+
+    max_deliverable = _dinic_max_flow(
+        list(nodes.keys()), edges, super_source, super_sink
+    )
+    return FlowCheckResult(
+        demand_total=demand_total,
+        max_deliverable=max_deliverable,
+        feasible=max_deliverable >= demand_total,
+        issues=[],
+    )
+
+
+def _dinic_max_flow(
+    node_ids: list[str],
+    edges: list[tuple[str, str, int]],
+    super_source: str,
+    super_sink: str,
+) -> int:
+    """Dinic 整数最大流。edges 的每条 (u, v, c) 为一条有向容量弧。"""
+    all_ids = list(node_ids) + [super_source, super_sink]
+    index = {nid: i for i, nid in enumerate(all_ids)}
+    n = len(all_ids)
+    graph: list[list[int]] = [[] for _ in range(n)]
+    capacities: list[int] = []
+    heads: list[int] = []
+
+    def add_arc(u: str, v: str, capacity: int) -> None:
+        iu, iv = index[u], index[v]
+        forward = len(capacities)
+        graph[iu].append(forward)
+        capacities.append(capacity)
+        heads.append(iv)
+        backward = len(capacities)
+        graph[iv].append(backward)
+        capacities.append(0)
+        heads.append(iu)
+
+    for u, v, capacity in edges:
+        add_arc(u, v, capacity)
+
+    s, t = index[super_source], index[super_sink]
+    level = [-1] * n
+
+    def bfs() -> bool:
+        for i in range(n):
+            level[i] = -1
+        level[s] = 0
+        queue: deque[int] = deque([s])
+        while queue:
+            u = queue.popleft()
+            for arc in graph[u]:
+                v = heads[arc]
+                if capacities[arc] > 0 and level[v] < 0:
+                    level[v] = level[u] + 1
+                    queue.append(v)
+        return level[t] >= 0
+
+    sys.setrecursionlimit(1_000_000)
+
+    def dfs(u: int, pushed: int) -> int:
+        if u == t or pushed == 0:
+            return pushed
+        while next_arc[u] < len(graph[u]):
+            arc = graph[u][next_arc[u]]
+            v = heads[arc]
+            if capacities[arc] > 0 and level[v] == level[u] + 1:
+                sent = dfs(v, min(pushed, capacities[arc]))
+                if sent:
+                    capacities[arc] -= sent
+                    capacities[arc ^ 1] += sent
+                    return sent
+            next_arc[u] += 1
+        return 0
+
+    # 总流量不可能超过超级源各出弧容量之和，用它作为整数增广上界
+    flow_bound = sum(c for u, _v, c in edges if u == super_source)
+    total = 0
+    while bfs():
+        next_arc = [0] * n
+        while total < flow_bound:
+            pushed = dfs(s, flow_bound - total)
+            if pushed == 0:
+                break
+            total += pushed
+    return total

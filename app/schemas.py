@@ -10,7 +10,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 
 NodeType = Literal["source", "sink", "junction"]
 
@@ -72,6 +72,56 @@ class SourceSwitchIn(BaseModel):
         min_length=1, description="水源编号与目标运行状态列表（同批编号不得重复）"
     )
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
+# ---------------------------------------------------------------- 最低流量核算
+
+
+class FlowSourceIn(BaseModel):
+    """单个水源的供水上限（非负整数升/小时）。"""
+
+    source_id: StrictStr = Field(min_length=1, description="水源节点编号")
+    supply_capacity: StrictInt = Field(ge=0, description="供水上限（升/小时，非负整数）")
+
+    model_config = {"extra": "forbid"}
+
+
+class FlowPipeIn(BaseModel):
+    """单条管段的双向共用输水上限（两方向合计，非负整数升/小时）。"""
+
+    pipe_id: StrictStr = Field(min_length=1, description="管段编号")
+    capacity: StrictInt = Field(
+        ge=0, description="双向共用输水上限（两方向合计，升/小时，非负整数）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class FlowDemandIn(BaseModel):
+    """单个用水点的最低流量需求（非负整数升/小时）。"""
+
+    sink_id: StrictStr = Field(min_length=1, description="用水点节点编号")
+    demand: StrictInt = Field(ge=0, description="最低流量需求（升/小时，非负整数）")
+
+    model_config = {"extra": "forbid"}
+
+
+class FlowCheckIn(BaseModel):
+    """最低流量核算入参：已读版本 + 全覆盖的水源/管段上限 + 非空用水点需求。"""
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[FlowSourceIn] = Field(
+        min_length=1, description="每个水源的供水上限（必须覆盖当前全部水源，不得重复）"
+    )
+    pipes: list[FlowPipeIn] = Field(
+        min_length=1,
+        description="每条管段的双向共用输水上限（必须覆盖当前全部管段，不得重复）",
+    )
+    demands: list[FlowDemandIn] = Field(
+        min_length=1, description="非空用水点最低需求列表（用水点必须存在，不得重复）"
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 # ---------------------------------------------------------------- 响应模型
@@ -211,6 +261,16 @@ class SourceSwitchOut(BaseModel):
     restored_sink_ids: list[str]
     # 仅在确有状态变化时产生快照；全部目标状态已满足（changed=false）时为 null
     snapshot_id: int | None = None
+
+
+class FlowCheckOut(BaseModel):
+    """最低流量核算只读结果：版本/匹配、需求总量、最大可交付总量与能否全部满足。"""
+
+    version: int
+    version_match: bool
+    demand_total: int
+    max_deliverable: int
+    feasible: bool
 
 
 class EventOut(BaseModel):

@@ -34,6 +34,18 @@ from app.planning import (  # noqa: E402
     SOURCE_NOT_FOUND,
     SOURCE_NOT_SWITCHABLE,
     SOURCE_TARGET_DUPLICATE,
+    FLOW_SOURCE_NOT_FOUND,
+    FLOW_SOURCE_NOT_SOURCE,
+    FLOW_SOURCE_DUPLICATE,
+    FLOW_SOURCE_MISSING,
+    FLOW_PIPE_NOT_FOUND,
+    FLOW_PIPE_DUPLICATE,
+    FLOW_PIPE_MISSING,
+    FLOW_SINK_NOT_FOUND,
+    FLOW_SINK_NOT_SINK,
+    FLOW_SINK_DUPLICATE,
+    FLOW_NO_DEMAND,
+    evaluate_flow_check,
 )
 
 
@@ -695,6 +707,203 @@ class SnapshotStateTests(unittest.TestCase):
             self.assertEqual(diff[section]["removed"], [])
         self.assertEqual(diff["valve_positions"]["changed"], [])
         self.assertEqual(diff["source_states"]["changed"], [])
+
+
+class FlowCheckTests(unittest.TestCase):
+    """最低流量核算（整数最大流）。"""
+
+    def _caps(self, nodes, pipes, source_cap=1000, pipe_cap=1000):
+        sources = [(nid, source_cap) for nid, n in nodes.items() if n.type == "source"]
+        plist = [(pid, pipe_cap) for pid in pipes]
+        return sources, plist
+
+    def test_single_path_capacity_bottleneck(self):
+        # S --P1(100)-- A --P2(60)-- U1：需求 50 满足、70 不满足（上限 60）
+        nodes = {
+            "S": Node("S", "source"),
+            "A": Node("A", "junction"),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {"P1": Pipe("P1", "S", "A"), "P2": Pipe("P2", "A", "U1")}
+        src, pc = [("S", 100)], [("P1", 100), ("P2", 60)]
+
+        r = evaluate_flow_check(nodes, pipes, src, pc, [("U1", 50)])
+        self.assertEqual(r.issues, [])
+        self.assertEqual((r.demand_total, r.max_deliverable, r.feasible), (50, 50, True))
+
+        r = evaluate_flow_check(nodes, pipes, src, pc, [("U1", 70)])
+        self.assertEqual((r.demand_total, r.max_deliverable, r.feasible), (70, 60, False))
+
+    def test_source_capacity_bottleneck(self):
+        nodes = {
+            "S": Node("S", "source"),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {"P1": Pipe("P1", "S", "U1")}
+        r = evaluate_flow_check(nodes, pipes, [("S", 30)], [("P1", 100)], [("U1", 40)])
+        self.assertEqual(r.max_deliverable, 30)
+        self.assertFalse(r.feasible)
+
+    def test_stopped_source_supplies_nothing(self):
+        nodes = {
+            "S": Node("S", "source", running=False),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {"P1": Pipe("P1", "S", "U1")}
+        r = evaluate_flow_check(nodes, pipes, [("S", 100)], [("P1", 100)], [("U1", 1)])
+        self.assertEqual(r.max_deliverable, 0)
+        self.assertFalse(r.feasible)
+
+    def test_closed_valve_and_pending_fault_block_flow(self):
+        # 示例管网：P4 已关（或 P6 待修复）时 U3 完全不可交付
+        nodes, pipes = build_demo()
+        src, pc = self._caps(nodes, pipes)
+        demands = [("U1", 10), ("U2", 10), ("U3", 10)]
+
+        r = evaluate_flow_check(
+            nodes, pipes, src, pc, demands, blocked_pipe_ids=frozenset({"P4"})
+        )
+        self.assertEqual(r.max_deliverable, 20)
+        self.assertFalse(r.feasible)
+
+        r = evaluate_flow_check(
+            nodes, pipes, src, pc, demands, blocked_pipe_ids=frozenset({"P6"})
+        )
+        self.assertEqual(r.max_deliverable, 20)
+        self.assertFalse(r.feasible)
+
+    def test_two_sources_redundant_supply(self):
+        # 双源经联络点 C 顶供：任一源单独可满足两用水点
+        nodes, pipes = build_two_source_demo()
+        r = evaluate_flow_check(
+            nodes,
+            pipes,
+            [("S1", 100), ("S2", 100)],
+            [("Q1", 100), ("Q2", 100), ("Q3", 100), ("Q4", 100)],
+            [("U1", 80), ("U2", 80)],
+        )
+        self.assertEqual(r.max_deliverable, 160)
+        self.assertTrue(r.feasible)
+
+        # 停运 S1 后仅 S2 经 Q3 进水，Q3 上限 50 卡住
+        nodes["S1"] = Node("S1", "source", running=False)
+        r = evaluate_flow_check(
+            nodes,
+            pipes,
+            [("S1", 100), ("S2", 100)],
+            [("Q1", 100), ("Q2", 100), ("Q3", 50), ("Q4", 100)],
+            [("U1", 80), ("U2", 80)],
+        )
+        self.assertEqual(r.max_deliverable, 50)
+        self.assertFalse(r.feasible)
+
+    def test_shared_undirected_pipe_capacity_counts_both_ways(self):
+        # S1--A, S2--B，A-B 联络管容量 10：S2 最多只能借 10 给 A 侧的 U1
+        nodes = {
+            "S1": Node("S1", "source"),
+            "S2": Node("S2", "source"),
+            "A": Node("A", "junction"),
+            "B": Node("B", "junction"),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {
+            "E1": Pipe("E1", "S1", "A"),
+            "E2": Pipe("E2", "S2", "B"),
+            "E3": Pipe("E3", "A", "B"),
+            "E4": Pipe("E4", "A", "U1"),
+        }
+        src = [("S1", 100), ("S2", 100)]
+        pc = [("E1", 100), ("E2", 100), ("E3", 10), ("E4", 1000)]
+        r = evaluate_flow_check(nodes, pipes, src, pc, [("U1", 120)])
+        self.assertEqual(r.max_deliverable, 110)
+        self.assertFalse(r.feasible)
+        r = evaluate_flow_check(nodes, pipes, src, pc, [("U1", 110)])
+        self.assertEqual(r.max_deliverable, 110)
+        self.assertTrue(r.feasible)
+
+    def test_unlisted_sinks_consume_nothing(self):
+        # U3 不列入需求：即使其所在管段故障阻断，也不影响核算
+        nodes, pipes = build_demo()
+        src, pc = self._caps(nodes, pipes)
+        r = evaluate_flow_check(
+            nodes, pipes, src, pc, [("U1", 50), ("U2", 50)],
+            blocked_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertEqual(r.demand_total, 100)
+        self.assertEqual(r.max_deliverable, 100)
+        self.assertTrue(r.feasible)
+
+    def test_zero_demand_sink_always_satisfied(self):
+        nodes = {
+            "S": Node("S", "source"),
+            "A": Node("A", "junction"),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {"P1": Pipe("P1", "S", "A")}
+        # 无管段连到 U1，但需求为 0：仍可满足，可交付 0
+        r = evaluate_flow_check(nodes, pipes, [("S", 10)], [("P1", 10)], [("U1", 0)])
+        self.assertEqual((r.demand_total, r.max_deliverable, r.feasible), (0, 0, True))
+
+    def test_parallel_pipes_capacities_add(self):
+        # 两条平行管段 S-A，各容量 30，合计可过 60
+        nodes = {
+            "S": Node("S", "source"),
+            "A": Node("A", "junction"),
+            "U1": Node("U1", "sink"),
+        }
+        pipes = {
+            "P1": Pipe("P1", "S", "A"),
+            "P2": Pipe("P2", "S", "A"),
+            "P3": Pipe("P3", "A", "U1"),
+        }
+        r = evaluate_flow_check(
+            nodes,
+            pipes,
+            [("S", 100)],
+            [("P1", 30), ("P2", 30), ("P3", 100)],
+            [("U1", 60)],
+        )
+        self.assertEqual(r.max_deliverable, 60)
+        self.assertTrue(r.feasible)
+
+    def test_validation_missing_coverage_duplicates_and_types(self):
+        nodes, pipes = build_demo()
+
+        # 缺少水源 S 与管段（只给部分）
+        r = evaluate_flow_check(nodes, pipes, [], [("P1", 1)], [("U1", 1)])
+        codes = {i.code for i in r.issues}
+        self.assertIn(FLOW_SOURCE_MISSING, codes)
+        # P2-P6 全部缺失
+        self.assertEqual(
+            {i.pipe_id for i in r.issues if i.code == FLOW_PIPE_MISSING},
+            {pid for pid in pipes if pid != "P1"},
+        )
+        self.assertEqual(r.max_deliverable, 0)
+        self.assertFalse(r.feasible)
+
+        # 编号不存在 / 类型错误 / 同类重复
+        r = evaluate_flow_check(
+            nodes,
+            pipes,
+            [("SX", 1), ("U1", 1)],  # 不存在 + 非水源；S 缺失
+            [("PX", 1)] + [(pid, 1) for pid in pipes],  # 不存在 + 全量
+            [("U1", 1), ("U1", 2), ("A", 3), ("UX", 4)],  # 重复/非sink/不存在
+        )
+        codes = {i.code for i in r.issues}
+        self.assertIn(FLOW_SOURCE_NOT_FOUND, codes)
+        self.assertIn(FLOW_SOURCE_NOT_SOURCE, codes)
+        self.assertIn(FLOW_SOURCE_MISSING, codes)
+        self.assertIn(FLOW_PIPE_NOT_FOUND, codes)
+        self.assertIn(FLOW_SINK_DUPLICATE, codes)
+        self.assertIn(FLOW_SINK_NOT_SINK, codes)
+        self.assertIn(FLOW_SINK_NOT_FOUND, codes)
+
+    def test_validation_empty_demands(self):
+        nodes, pipes = build_demo()
+        src = [(nid, 1) for nid, n in nodes.items() if n.type == "source"]
+        pc = [(pid, 1) for pid in pipes]
+        r = evaluate_flow_check(nodes, pipes, src, pc, [])
+        self.assertEqual([i.code for i in r.issues], [FLOW_NO_DEMAND])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from .planning import (
     RecommendResult,
     RestoreResult,
     SourceSwitchResult,
+    DeliveryResult,
 )
 
 def serialize_node(node: Node) -> dict:
@@ -104,6 +105,20 @@ def serialize_source_switch_preview(
         "restored_sink_ids": list(result.restored_sink_ids),
         "block_reasons": [b.as_dict() for b in result.blocks],
         "issues": [i.as_dict() for i in result.issues],
+    }
+
+
+def serialize_delivery(
+    version: int,
+    expected_version: int,
+    result: DeliveryResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "total_demand": result.total_demand,
+        "max_delivered_total": result.max_delivered_total,
+        "feasible": result.feasible,
     }
 
 

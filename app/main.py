@@ -12,6 +12,7 @@
 - POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
 - POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
 - POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
+- POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -29,10 +30,12 @@ from .planning import (
     Node,
     Pipe,
     diff_states,
+    evaluate_delivery,
     evaluate_plan,
     evaluate_restore,
     evaluate_source_switch,
     recommend_plan,
+    validate_delivery_request,
     validate_import,
     BLOCKING_ISSUE_CODES,
 )
@@ -42,6 +45,7 @@ from .schemas import (
     RecommendIn,
     RestoreIn,
     SourceSwitchIn,
+    DeliveryEvaluateIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -51,6 +55,7 @@ from .schemas import (
     RestoreOut,
     SourceSwitchPreviewOut,
     SourceSwitchOut,
+    DeliveryEvaluateOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -61,6 +66,7 @@ from .serializers import (
     serialize_recommend,
     serialize_restore_preview,
     serialize_source_switch_preview,
+    serialize_delivery,
     serialize_snapshot,
     serialize_snapshot_row,
     serialize_snapshot_diff,
@@ -474,6 +480,51 @@ def source_switch_confirm(payload: SourceSwitchIn):
     return _switch_response_body(
         outcome["version"], targets, result, outcome["snapshot_id"]
     )
+
+
+# ---------------------------------------------------------------- 流量核算（只读）
+
+
+@app.post(
+    "/api/delivery/evaluate",
+    response_model=DeliveryEvaluateOut,
+    tags=["流量核算"],
+    summary="用水点最低流量核算：现有阀位与故障状态下的最大可交付总量（只读）",
+)
+def evaluate_delivery_request(payload: DeliveryEvaluateIn):
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 已关闭阀门与待修复故障管段不可通行：阻断口径与既有可达性接口完全一致
+        pending_fault_ids = frozenset(
+            e["fault_pipe_id"] for e in db.list_open_events(conn)
+        )
+
+    source_caps = [(s.source_id, s.capacity) for s in payload.sources]
+    pipe_caps = [(p.pipe_id, p.capacity) for p in payload.pipes]
+    demands = [(d.sink_id, d.demand) for d in payload.demands]
+
+    issues = validate_delivery_request(nodes, pipes, source_caps, pipe_caps, demands)
+    if issues:
+        raise ApiError(
+            422,
+            "DELIVERY_REQUEST_INVALID",
+            "流量核算请求非法（编号未覆盖当前管网、同类重复、用水点不存在或需求列表为空）",
+            issues=issues,
+        )
+
+    blocked_pipe_ids = frozenset(
+        p.id for p in pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_ids
+
+    result = evaluate_delivery(
+        nodes,
+        pipes,
+        source_caps,
+        pipe_caps,
+        demands,
+        blocked_pipe_ids=blocked_pipe_ids,
+    )
+    return serialize_delivery(version, payload.version, result)
 
 
 # ---------------------------------------------------------------- 状态快照回看

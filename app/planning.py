@@ -29,12 +29,25 @@
   用水点，以及每条待修复故障管段的重新进水风险；仅水源节点可切换，同批编号
   不得重复；全部目标状态已满足（无实际变化）时不推进版本；停运可导致全网无
   运行水源（此时所有用水点失供，不额外报错）。
+
+流量核算（delivery）规则（只读，不改阀位/事件/版本/快照）：
+- 调度员携带已读版本、每个水源的供水上限、每条管段的双向共用输水上限与
+  非空用水点需求（流量均为非负整数升/小时），核算现有阀位与故障状态下
+  能否满足一组用水点的最低流量。
+- 水源与管段编号必须**完整覆盖当前管网**（不多不少）、同类不得重复；
+  用水点编号必须存在（仅列出本次有需求的点，未列需求的点不消耗流量）。
+- 停运水源不供水（容量视为 0）；已关闭阀门与待修复故障管段不可通行
+  （容量视为 0，与可达性口径完全一致）。
+- 管段为双向共用输水上限：两方向净流量合计（即净流量绝对值）不得超过上限，
+  按无向边容量建模；最大可交付总量 = 超级源→各水源→管网→各需求点→超级汇
+  的整数最大流（对总需求封顶）。全部为整数容量，最大流为整数。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import deque
 from itertools import combinations
+import sys
 
 # 问题代码 ---------------------------------------------------------------
 
@@ -59,6 +72,18 @@ NON_VALVE_PIPE_CLOSED = "NON_VALVE_PIPE_CLOSED"
 SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"          # 编号不存在
 SOURCE_NOT_SWITCHABLE = "SOURCE_NOT_SWITCHABLE"  # 节点存在但不是水源，不可切换
 SOURCE_TARGET_DUPLICATE = "SOURCE_TARGET_DUPLICATE"  # 同批水源编号重复
+
+# 流量核算请求问题
+DELIVERY_SOURCE_NOT_FOUND = "DELIVERY_SOURCE_NOT_FOUND"  # 水源编号在当前管网不存在
+DELIVERY_SOURCE_MISSING = "DELIVERY_SOURCE_MISSING"  # 当前管网水源未在请求中列出（未覆盖）
+DELIVERY_SOURCE_DUPLICATE = "DELIVERY_SOURCE_DUPLICATE"  # 水源编号重复
+DELIVERY_PIPE_NOT_FOUND = "DELIVERY_PIPE_NOT_FOUND"  # 管段编号在当前管网不存在
+DELIVERY_PIPE_MISSING = "DELIVERY_PIPE_MISSING"  # 当前管网管段未在请求中列出（未覆盖）
+DELIVERY_PIPE_DUPLICATE = "DELIVERY_PIPE_DUPLICATE"  # 管段编号重复
+DELIVERY_SINK_NOT_FOUND = "DELIVERY_SINK_NOT_FOUND"  # 用水点编号不存在
+DELIVERY_SINK_NOT_SINK = "DELIVERY_SINK_NOT_SINK"  # 节点存在但不是用水点
+DELIVERY_SINK_DUPLICATE = "DELIVERY_SINK_DUPLICATE"  # 用水点编号重复
+DELIVERY_DEMANDS_EMPTY = "DELIVERY_DEMANDS_EMPTY"  # 用水点需求列表为空
 
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
@@ -727,6 +752,272 @@ def evaluate_source_switch(
         restored_sink_ids=restored,
         blocks=blocks,
         issues=[],
+    )
+
+
+# ---------------------------------------------------------------- 流量核算
+
+
+@dataclass
+class DeliveryResult:
+    """用水点最低流量核算结果（只读计算，不改任何状态）。
+
+    - total_demand：本次请求的需求总量（未列需求的用水点不消耗流量）；
+    - max_delivered_total：现有阀位与故障状态下，按各水源供水上限与各管段
+      双向共用输水上限可交付到这些用水点的最大总量（对总需求封顶）；
+    - feasible：max_delivered_total == total_demand，即全部最低需求均可满足。
+    """
+
+    total_demand: int
+    max_delivered_total: int
+    feasible: bool
+    issues: list[Issue] = field(default_factory=list)
+
+
+def validate_delivery_request(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int]],
+) -> list[Issue]:
+    """校验流量核算请求本身（结构 / 编号 / 覆盖 / 重复）。
+
+    - 水源、管段编号必须完整覆盖当前管网：存在性 + 无重复 + 无遗漏（不多不少）；
+    - 用水点编号必须存在且节点类型为 sink，同批不得重复；需求列表非空。
+    容量与需求的非负整数约束由请求模型（pydantic）保证，此处不再重复。
+    """
+    issues: list[Issue] = []
+
+    network_source_ids = {nid for nid, n in nodes.items() if n.type == "source"}
+    seen_sources: set[str] = set()
+    for source_id, _cap in source_caps:
+        if source_id in seen_sources:
+            issues.append(
+                Issue(
+                    DELIVERY_SOURCE_DUPLICATE,
+                    f"水源编号重复：{source_id}",
+                    source_id,
+                )
+            )
+            continue
+        seen_sources.add(source_id)
+        if source_id not in nodes or nodes[source_id].type != "source":
+            # 编号不存在或节点不是水源，均视为该水源不属于当前管网
+            issues.append(
+                Issue(
+                    DELIVERY_SOURCE_NOT_FOUND,
+                    f"水源编号在当前管网不存在：{source_id}",
+                    source_id,
+                )
+            )
+    for missing in sorted(network_source_ids - seen_sources):
+        issues.append(
+            Issue(
+                DELIVERY_SOURCE_MISSING,
+                f"当前管网水源未在请求中列出（水源容量须覆盖全部水源）：{missing}",
+                missing,
+            )
+        )
+
+    seen_pipes: set[str] = set()
+    for pipe_id, _cap in pipe_caps:
+        if pipe_id in seen_pipes:
+            issues.append(
+                Issue(
+                    DELIVERY_PIPE_DUPLICATE,
+                    f"管段编号重复：{pipe_id}",
+                    pipe_id,
+                )
+            )
+            continue
+        seen_pipes.add(pipe_id)
+        if pipe_id not in pipes:
+            issues.append(
+                Issue(
+                    DELIVERY_PIPE_NOT_FOUND,
+                    f"管段编号在当前管网不存在：{pipe_id}",
+                    pipe_id,
+                )
+            )
+    for missing in sorted(set(pipes) - seen_pipes):
+        issues.append(
+            Issue(
+                DELIVERY_PIPE_MISSING,
+                f"当前管网管段未在请求中列出（管段容量须覆盖全部管段）：{missing}",
+                missing,
+            )
+        )
+
+    if not demands:
+        issues.append(
+            Issue(
+                DELIVERY_DEMANDS_EMPTY,
+                "用水点需求列表不能为空：至少给出一个非空（列名）用水点需求",
+            )
+        )
+    seen_sinks: set[str] = set()
+    for sink_id, _demand in demands:
+        if sink_id in seen_sinks:
+            issues.append(
+                Issue(
+                    DELIVERY_SINK_DUPLICATE,
+                    f"用水点编号重复：{sink_id}",
+                    sink_id,
+                )
+            )
+            continue
+        seen_sinks.add(sink_id)
+        node = nodes.get(sink_id)
+        if node is None:
+            issues.append(
+                Issue(
+                    DELIVERY_SINK_NOT_FOUND,
+                    f"用水点编号不存在：{sink_id}",
+                    sink_id,
+                )
+            )
+        elif node.type != "sink":
+            issues.append(
+                Issue(
+                    DELIVERY_SINK_NOT_SINK,
+                    f"节点 {sink_id} 不是用水点，仅用水点节点可申报需求",
+                    sink_id,
+                )
+            )
+    return issues
+
+
+def _undirected_max_flow(
+    node_ids: list[str],
+    edges: list[tuple[str, str, int]],
+    sources: list[tuple[str, int]],
+    sinks: list[tuple[str, int]],
+) -> int:
+    """整数无向（双向共用容量）多源多汇最大流，Dinic 实现。
+
+    - edges：(u, v, c)，无向边净流量 |f| <= c（两方向合计不得超过 c）。
+      残差网络中该边初始两个方向的剩余容量均为 c：向一个方向输水 d 后，
+      该方向剩余 c-d、反向剩余 c+d（c 为可回撤量、d 为换向余量），
+      天然保证任意时刻两方向净流量之和不超过 c。
+    - sources：(节点, 供水上限)；sinks：(节点, 需求上限)。
+    - 增加超级源/超级汇把多源多汇化为单源单汇；汇边容量为各点需求，
+      因而最大流天然对总需求封顶（其值即“可交付到这些需求点的最大总量”）。
+    所有容量均为非负整数，最大流值为整数。
+    """
+    index = {nid: i for i, nid in enumerate(node_ids)}
+    super_source = len(node_ids)
+    super_sink = super_source + 1
+    n = super_sink + 1
+
+    graph: list[list[list[int]]] = [[] for _ in range(n)]
+
+    def add_arc(u: int, v: int, cap: int) -> int:
+        graph[u].append([v, cap, len(graph[v])])
+        graph[v].append([u, 0, len(graph[u]) - 1])
+        return len(graph[u]) - 1
+
+    for u, v, cap in edges:
+        if cap <= 0:
+            continue
+        iu, iv = index[u], index[v]
+        # 无向边：两条相互独立的有向弧，初始容量均为 cap。
+        # 二者互为“输水余量 + 对向可回撤量”，见函数说明。
+        add_arc(iu, iv, cap)
+        add_arc(iv, iu, cap)
+    for nid, cap in sources:
+        if cap > 0:
+            add_arc(super_source, index[nid], cap)
+    for nid, cap in sinks:
+        if cap > 0:
+            add_arc(index[nid], super_sink, cap)
+
+    total = 0
+    # 图规模受管网节点数限制；提高递归上限，避免深链管网触发默认限制
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), n * 4 + 1000))
+    while True:
+        # BFS 分层
+        level = [-1] * n
+        level[super_source] = 0
+        queue: deque[int] = deque([super_source])
+        while queue:
+            u = queue.popleft()
+            for v, cap, rev in graph[u]:
+                if cap > 0 and level[v] < 0:
+                    level[v] = level[u] + 1
+                    queue.append(v)
+        if level[super_sink] < 0:
+            return total
+
+        cur = [0] * n
+
+        def dfs(u: int, pushed: int) -> int:
+            if u == super_sink:
+                return pushed
+            while cur[u] < len(graph[u]):
+                edge = graph[u][cur[u]]
+                v, cap, rev = edge
+                if cap > 0 and level[v] == level[u] + 1:
+                    sent = dfs(v, min(pushed, cap))
+                    if sent:
+                        edge[1] -= sent
+                        graph[v][rev][1] += sent
+                        return sent
+                cur[u] += 1
+            return 0
+
+        while True:
+            pushed = dfs(super_source, 10**18)
+            if not pushed:
+                break
+            total += pushed
+
+
+def evaluate_delivery(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    source_caps: list[tuple[str, int]],
+    pipe_caps: list[tuple[str, int]],
+    demands: list[tuple[str, int]],
+    *,
+    blocked_pipe_ids: frozenset[str] = frozenset(),
+) -> DeliveryResult:
+    """在现有阀位与故障状态下核算用水点最低流量能否满足（只读）。
+
+    blocked_pipe_ids：已关闭阀门与待修复故障管段，按与可达性计算完全一致的
+    口径视为不可通行（容量按 0 处理）。停运水源(running=False)不供水
+    （容量按 0 处理）。调用方须先通过 validate_delivery_request 结构校验。
+    """
+    total_demand = sum(d for _sid, d in demands)
+
+    source_cap_map = dict(source_caps)
+    running_sources = [
+        (nid, source_cap_map[nid])
+        for nid, node in nodes.items()
+        if node.type == "source" and node.running and source_cap_map.get(nid, 0) > 0
+    ]
+
+    sink_demands = [(nid, d) for nid, d in demands if d > 0]
+
+    pipe_cap_map = dict(pipe_caps)
+    edges = [
+        (p.from_node, p.to_node, 0 if p.id in blocked_pipe_ids else pipe_cap_map[p.id])
+        for p in pipes.values()
+    ]
+
+    if total_demand == 0 or not running_sources or not sink_demands:
+        max_delivered = 0
+    else:
+        max_delivered = _undirected_max_flow(
+            list(nodes.keys()), edges, running_sources, sink_demands
+        )
+        # 汇边容量已对各点需求封顶，整体不超过需求总量（防御性夹取）
+        max_delivered = min(max_delivered, total_demand)
+
+    return DeliveryResult(
+        total_demand=total_demand,
+        max_delivered_total=max_delivered,
+        feasible=max_delivered == total_demand,
     )
 
 

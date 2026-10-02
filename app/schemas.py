@@ -10,7 +10,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 NodeType = Literal["source", "sink", "junction"]
 
@@ -72,6 +72,56 @@ class SourceSwitchIn(BaseModel):
         min_length=1, description="水源编号与目标运行状态列表（同批编号不得重复）"
     )
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
+class DeliverySourceIn(BaseModel):
+    """单个水源的供水上限（非负整数升/小时；停运水源不供水，仍须列出）。"""
+
+    source_id: str = Field(min_length=1, description="水源节点编号")
+    # 流量均为非负整数：StrictInt 拒绝 true/false 等非整数类型（类型错误整体拒绝）
+    capacity: StrictInt = Field(ge=0, description="供水上限（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class DeliveryPipeIn(BaseModel):
+    """单条管段的双向共用输水上限（两方向合计不得超过该值）。"""
+
+    pipe_id: str = Field(min_length=1, description="管段编号")
+    capacity: StrictInt = Field(
+        ge=0, description="双向共用输水上限（非负整数，升/小时）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DeliveryDemandIn(BaseModel):
+    """单个用水点的最低流量需求（未列出的用水点不消耗流量）。"""
+
+    sink_id: str = Field(min_length=1, description="用水点节点编号")
+    demand: StrictInt = Field(ge=0, description="最低流量需求（非负整数，升/小时）")
+
+    model_config = {"extra": "forbid"}
+
+
+class DeliveryEvaluateIn(BaseModel):
+    """流量核算入参：已读版本 + 每个水源供水上限 + 每条管段双向共用上限 + 用水点需求。
+
+    水源与管段编号须完整覆盖当前管网（不多不少、同类不重复）；
+    用水点编号须存在且为 sink；需求列表非空（允许单点需求为 0）。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    sources: list[DeliverySourceIn] = Field(
+        description="每个水源的供水上限（须覆盖当前管网全部水源；空网为空列表）"
+    )
+    pipes: list[DeliveryPipeIn] = Field(
+        description="每条管段的双向共用输水上限（须覆盖全部管段；空网为空列表）"
+    )
+    demands: list[DeliveryDemandIn] = Field(
+        description="非空用水点需求列表（未列需求的用水点不消耗流量）；"
+        "为空时由领域校验统一返回 DELIVERY_DEMANDS_EMPTY"
+    )
 
 
 # ---------------------------------------------------------------- 响应模型
@@ -211,6 +261,16 @@ class SourceSwitchOut(BaseModel):
     restored_sink_ids: list[str]
     # 仅在确有状态变化时产生快照；全部目标状态已满足（changed=false）时为 null
     snapshot_id: int | None = None
+
+
+class DeliveryEvaluateOut(BaseModel):
+    """流量核算只读结果：当前版本/版本是否匹配/需求总量/最大可交付总量/能否全部满足。"""
+
+    version: int
+    version_match: bool
+    total_demand: int
+    max_delivered_total: int
+    feasible: bool
 
 
 class EventOut(BaseModel):

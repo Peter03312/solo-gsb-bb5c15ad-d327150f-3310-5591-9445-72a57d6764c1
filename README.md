@@ -12,8 +12,10 @@
 **整网导入、隔离提交、复供确认、水源切换**每次实际改变状态时，在**同一事务**内冻结一条
 不可复用编号的**操作后状态快照**，供调度员按操作顺序回看当时的节点、水源运行状态、
 管段阀位、待修复故障与由运行水源可达的用水点，并支持相邻快照六类净变化对照。
+调度员还可在**现有阀位与故障状态**下携带各水源供水上限、各管段双向共用输水上限与
+用水点最低需求，**只读核算**管网能否满足这组用水点的最低流量（整数最大流）。
 
-> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演）
+> 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、流量核算）
 > 只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
@@ -147,6 +149,30 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   明细在 `issues`；预演不拒绝，返回 200 并在 `issues` 中列出）、
   重新进水风险 `422 SOURCE_SWITCH_UNSAFE`。
 
+**流量核算**（`POST /api/delivery/evaluate`，**只读**，不改阀位/事件/版本/快照）：
+
+- 入参为已读 `version` + **每个水源**的供水上限 `sources` + **每条管段**的双向共用
+  输水上限 `pipes` + **非空**用水点需求 `demands`；所有流量均为**非负整数升/小时**
+  （布尔值、小数、负数均按类型/数值错误处理，`422` 整体拒绝）。
+- 编号规则（任一不满足即整体拒绝，`422 DELIVERY_REQUEST_INVALID`，返回全部问题明细）：
+  - 水源、管段编号必须**完整覆盖当前管网**（不多不少）：遗漏报
+    `DELIVERY_SOURCE_MISSING` / `DELIVERY_PIPE_MISSING`；
+    编号不存在报 `DELIVERY_SOURCE_NOT_FOUND` / `DELIVERY_PIPE_NOT_FOUND`；
+    同类重复报 `DELIVERY_SOURCE_DUPLICATE` / `DELIVERY_PIPE_DUPLICATE`；
+  - 用水点编号必须**存在且为 sink**：不存在 `DELIVERY_SINK_NOT_FOUND`、
+    节点不是用水点 `DELIVERY_SINK_NOT_SINK`、重复 `DELIVERY_SINK_DUPLICATE`；
+    只需列出本次有需求的点（需求可为 0），`demands` 为空报 `DELIVERY_DEMANDS_EMPTY`。
+- 通水口径与既有可达性接口**完全一致**：停运水源不供水（容量按 0）；
+  **已关闭阀门与待修复(open)故障管段不可通行**（容量按 0）；
+  未列需求的用水点不消耗流量。
+- 管段为**双向共用**输水上限：两方向净流量合计（净流量绝对值）不得超过该管段上限，
+  按无向边容量建模；以超级源→运行水源、需求点→超级汇构造整数网络流，
+  汇边容量为各点需求，因此结果对总需求封顶。
+- 返回当前版本 `version`、版本是否匹配 `version_match`、需求总量 `total_demand`、
+  **最大可交付总量** `max_delivered_total` 与**能否全部满足** `feasible`
+  （`feasible = max_delivered_total == total_demand`）；
+  过期版本**不拒绝**：仍按当前状态核算，仅 `version_match=false`（与预演类接口一致）。
+
 **状态快照（操作后回看）**（只增不改，编号由数据库序列全局单调分配，**不可复用**）：
 
 - 仅四类**实际改变状态**的写操作产生快照，且与状态变更在**同一事务**内冻结：
@@ -186,6 +212,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/isolation/events/{event_id}/restore` | 复供确认（单事务复核 + 重开阀门） |
 | POST | `/api/sources/switch/preview` | 水源停运/恢复预演（只读：失供/恢复用水点、待修复故障重新进水风险） |
 | POST | `/api/sources/switch` | 水源停运/恢复确认（锁版本复核 + 原子更新水源状态） |
+| POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
@@ -712,6 +739,82 @@ python3 examples/snapshot_demo.py http://localhost:8000
 相邻对照六类净变化 → 版本冲突、不可隔离、水源空切换均不留快照 →
 整网重导版本重置但旧快照不覆盖、编号不复用 → 未知编号与非相邻对照报错。
 
+### 11. 用水点最低流量核算（只读）
+
+调度员在**现有阀位与故障状态**下，携带已读版本、每个水源的供水上限、每条管段的
+双向共用输水上限与本次申报需求的用水点，核算最大可交付总量（**只读**，不改任何状态）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/delivery/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "sources": [{"source_id": "S", "capacity": 1000}],
+    "pipes": [
+      {"pipe_id": "P1", "capacity": 100},
+      {"pipe_id": "P2", "capacity": 100},
+      {"pipe_id": "P3", "capacity": 6},
+      {"pipe_id": "P4", "capacity": 100},
+      {"pipe_id": "P5", "capacity": 100},
+      {"pipe_id": "P6", "capacity": 100}
+    ],
+    "demands": [
+      {"sink_id": "U1", "demand": 10},
+      {"sink_id": "U2", "demand": 10},
+      {"sink_id": "U3", "demand": 10}
+    ]
+  }'
+```
+
+响应（`U1` 的唯一通道 `P3` 双向共用上限只有 6，最多交付 6，总需求 30 只能交付 26）：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "total_demand": 30,
+  "max_delivered_total": 26,
+  "feasible": false
+}
+```
+
+本轮用法要点：
+
+- `sources` / `pipes` 必须**逐一覆盖当前管网全部水源与管段**（停运水源仍须列出，
+  已关闭阀门/待修复故障管段也仍须列出）；`demands` 只列本次申报需求的用水点，
+  未列出的点不消耗流量（例如只核算 U1/U2 时不传 U3）。
+- 容量与需求均为**非负整数升/小时**；停运水源、已关阀门、待修复故障管段
+  分别按容量 0 / 不可通行处理（传 0 或传更大的值结果相同，状态由管网决定）。
+- 一条管段两方向合计不得超过其 `capacity`（无向共用容量）；
+  `max_delivered_total` 对总需求封顶，`feasible=true` 即全部最低需求可满足。
+- 用过期版本（如 `"version": 99`）调用不报错，仍按当前状态核算，
+  仅 `version_match=false`，据此提示调度员重新读网。
+- 编号未覆盖/重复/不存在、用水点类型错误、需求列表为空、布尔/小数/负数等
+  类型或数值错误均 `422 DELIVERY_REQUEST_INVALID` 整体拒绝，明细在 `error.issues`。
+
+隔离 P6（关 P4）后再核算同一需求：故障管段 P6 与已关阀门 P4 阻断，U3 断供，
+只交付 U1/U2 的 20 L/h，`feasible=false`；只读核对版本仍为 2、阀位与事件不变：
+
+```bash
+# 先制造故障态
+curl -s -X POST http://localhost:8000/api/isolation/submit \
+  -H 'Content-Type: application/json' \
+  -d '{"fault_pipe_id":"P6","close_pipe_ids":["P4"],"version":1}'
+# 再核算（version 传 2）：U3 不可交付
+```
+
+流量核算全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/delivery_demo.py
+# 或指定地址：
+python3 examples/delivery_demo.py http://localhost:8000
+```
+
+脚本依次演示：容量充足全部满足 → 管段瓶颈交付不足 → 过期版本仍按当前状态核算 →
+水源上限不足 → 隔离关阀后故障片区断供 / 只申报可达用水点即可满足 →
+编号未覆盖/重复/类型错误的 422 拒绝 → 确认版本、阀位与事件全程未被改写。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -740,13 +843,13 @@ python3 examples/source_switch_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，48 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，66 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，55 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，68 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -759,7 +862,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -771,6 +874,7 @@ examples/
   restore_demo.py         # 复供全流程示例
   recommend_demo.py       # 关阀建议全流程示例
   source_switch_demo.py   # 水源停运/恢复全流程示例
+  delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py
